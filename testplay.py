@@ -248,4 +248,4 @@ def run_api():
     app.run(host='0.0.0.0', port=5000)
 
 threading.Thread(target=run_api, daemon=True).start()
-bot.run(os.environ.get('DISCORD_TOKEN'))
+bot.run('MTU0MDczNDc3MTExMjcxMDIxNA.G5UuGk.AOVkSwPhKnYQIUQQeMMjggs1HCJTFe0RKnCWgQ')
