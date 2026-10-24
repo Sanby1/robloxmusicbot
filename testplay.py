@@ -7,6 +7,8 @@ import asyncio
 import aiohttp
 import os
 import json
+from io import BytesIO
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -33,6 +35,7 @@ veri_tabani = {}
 kayitli_hesaplar = load_accounts()
 roblox_onay_kodlari = {}
 active_tickets = {}
+cover_cache = {} # URL -> {"pixels": [...], "color": [r, g, b]}
 
 SIGN_KANAL_ID = 123456789012345678 # 🔥 KENDİ KANAL ID'Nİ YAZMAYI UNUTMA
 VERIFIED_ROLE_ID = 1540891610739507331 # 🔥 ROL ID'N
@@ -59,6 +62,39 @@ async def get_lyrics(artist, title, duration):
         pass
     return "No lyrics available"
 
+# 🔥 SPOTIFY ALBÜM KAPAĞINI GERÇEK PİKSEL MATRİSİNE (16x16) VE BASKIN RENGE ÇEVİRİR 🔥
+async def fetch_album_cover_pixels(url):
+    if not url:
+        return [], [24, 24, 24]
+    if url in cover_cache:
+        return cover_cache[url]["pixels"], cover_cache[url]["color"]
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=4) as resp:
+                if resp.status == 200:
+                    img_bytes = await resp.read()
+                    img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                    # 1x1 ile şarkı kapağının gerçek baskın rengini bul
+                    dom = img.resize((1, 1), Image.Resampling.LANCZOS).getpixel((0, 0))
+                    dom_color = [int(dom[0]), int(dom[1]), int(dom[2])]
+
+                    # 16x16=256 piksel matrisi (Roblox'ta canlı albüm kapağını birebir çizer)
+                    small = img.resize((16, 16), Image.Resampling.LANCZOS)
+                    pixels = []
+                    for y in range(16):
+                        for x in range(16):
+                            r, g, b = small.getpixel((x, y))
+                            pixels.append(f"{r:02x}{g:02x}{b:02x}")
+
+                    if len(cover_cache) > 200:
+                        cover_cache.clear()
+                    cover_cache[url] = {"pixels": pixels, "color": dom_color}
+                    return pixels, dom_color
+    except Exception as e:
+        print("Kapak işleme hatası:", e)
+    return [], [24, 24, 24]
+
 @app.route('/api/all_users')
 def get_all_users():
     sonuc = {}
@@ -73,6 +109,7 @@ def get_all_users():
                 "sarki_toplam": 210,
                 "sarki_sozu": "♪ No lyrics",
                 "album_kapak": "",
+                "kapak_pikseller": [],
                 "bant_renk": [24, 24, 24]
             }
             continue
@@ -114,6 +151,7 @@ def get_all_users():
             "sarki_toplam": veri.get("sarki_toplam", 210),
             "sarki_sozu": aktif_soz[:60],
             "album_kapak": veri.get("album_kapak", ""),
+            "kapak_pikseller": veri.get("kapak_pikseller", []),
             "bant_renk": veri.get("bant_renk", [24, 24, 24])
         }
     return jsonify(sonuc)
@@ -221,6 +259,7 @@ async def extract_member_presence(member: discord.Member):
     oyun_baslangic, sarki_baslangic, sarki_toplam = 0, 0, 210
     synced, plain = None, "♪ No lyrics"
     album_kapak = ""
+    kapak_pikseller = []
     bant_renk = [24, 24, 24]
 
     for act in member.activities:
@@ -236,8 +275,7 @@ async def extract_member_presence(member: discord.Member):
                 sarki_toplam = int(act.duration.total_seconds())
             if hasattr(act, 'album_cover_url') and act.album_cover_url:
                 album_kapak = str(act.album_cover_url)
-            if hasattr(act, 'color') and act.color:
-                bant_renk = [act.color.r, act.color.g, act.color.b]
+                kapak_pikseller, bant_renk = await fetch_album_cover_pixels(album_kapak)
 
             lyrics_text = await get_lyrics(act.artist, act.title, sarki_toplam)
             if lyrics_text != "No lyrics available":
@@ -255,6 +293,7 @@ async def extract_member_presence(member: discord.Member):
         "synced_lyrics": synced,
         "plain_lyrics": plain,
         "album_kapak": album_kapak,
+        "kapak_pikseller": kapak_pikseller,
         "bant_renk": bant_renk
     }
 
