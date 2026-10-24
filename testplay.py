@@ -9,11 +9,18 @@ import os
 import json
 import struct
 import zlib
+import re
 
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
-GRID_RES = 36  # 36x36 = 1,296 pixels (High-definition, ultra-smooth album cover in Roblox!)
+HIGH_RES = 45  # 45x45 = 2,025 pixels (Ultra-sharp HD album cover when safe!)
+CENSOR_RES = 8 # 8x8 = 64 pixels (Heavy pixelated mosaic blur when NSFW / Explicit / Slang!)
+
+SLANG_NSFW_REGEX = re.compile(
+    r"\b(sex|sexy|porn|nsfw|nude|naked|hentai|xxx|erotic|fuck|shit|bitch|dick|pussy|ass|slut|whore|cock|boobs|tits|amk|aq|sik|sikiş|yarrak|orospu|piç|göt|meme|çıplak)\b",
+    re.IGNORECASE
+)
 
 def load_accounts():
     if os.path.exists(DB_FILE):
@@ -42,9 +49,54 @@ SIGN_KANAL_ID = 123456789012345678 # Put your Discord channel ID here
 VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
 
 # =========================================================================
-# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (36x36 = 1,296 PIXELS)
+# SKIN-TONE / NSFW HEURISTIC DETECTOR FOR PIXEL GRID
+# If a large percentage of the album cover consists of contiguous skin-tone
+# pixels (potential nudity/NSFW imagery), we automatically censor-pixelate it!
 # =========================================================================
-def parse_png_to_grid(png_bytes, grid_size=GRID_RES):
+def is_skin_tone_heavy(hex_pixels):
+    if not hex_pixels:
+        return False
+    skin_count = 0
+    for hx in hex_pixels:
+        r = int(hx[0:2], 16)
+        g = int(hx[2:4], 16)
+        b = int(hx[4:6], 16)
+        # Classic RGB + YCbCr skin-color cluster bounds
+        if (r > 95 and g > 40 and b > 20 and
+            (max(r, g, b) - min(r, g, b)) > 15 and
+            abs(r - g) > 15 and r > g and r > b):
+            cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
+            cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
+            if 77 <= cb <= 127 and 133 <= cr <= 173:
+                skin_count += 1
+    return (skin_count / len(hex_pixels)) >= 0.52
+
+def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
+    if len(hex_pixels) != grid_size * grid_size:
+        return hex_pixels
+    out = list(hex_pixels)
+    block = max(1, grid_size // coarse_size)
+    for by in range(0, grid_size, block):
+        for bx in range(0, grid_size, block):
+            r_sum = g_sum = b_sum = cnt = 0
+            for y in range(by, min(by + block, grid_size)):
+                for x in range(bx, min(bx + block, grid_size)):
+                    hx = hex_pixels[y * grid_size + x]
+                    r_sum += int(hx[0:2], 16)
+                    g_sum += int(hx[2:4], 16)
+                    b_sum += int(hx[4:6], 16)
+                    cnt += 1
+            if cnt > 0:
+                avg_hex = f"{int(r_sum/cnt):02x}{int(g_sum/cnt):02x}{int(b_sum/cnt):02x}"
+                for y in range(by, min(by + block, grid_size)):
+                    for x in range(bx, min(bx + block, grid_size)):
+                        out[y * grid_size + x] = avg_hex
+    return out
+
+# =========================================================================
+# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (45x45 = 2,025 PIXELS)
+# =========================================================================
+def parse_png_to_grid(png_bytes, grid_size=HIGH_RES):
     if len(png_bytes) < 33 or png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
         return [], [24, 24, 24]
     pos = 8
@@ -133,7 +185,14 @@ def parse_png_to_grid(png_bytes, grid_size=GRID_RES):
 
 async def fetch_album_cover_pixels(url, artist="", title=""):
     target_url = url
-    if not target_url and artist and title:
+    is_explicit_or_nsfw = False
+
+    # Check if song title or artist contains slang / NSFW keywords
+    if SLANG_NSFW_REGEX.search(f"{artist} {title}"):
+        is_explicit_or_nsfw = True
+
+    # Query iTunes API both for fallback cover URL and to check official trackExplicitness / collectionExplicitness
+    if artist and title:
         try:
             search_q = f"{artist} {title}"
             async with aiohttp.ClientSession() as session:
@@ -142,15 +201,25 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                         js = await r.json(content_type=None)
                         results = js.get("results", [])
                         if results:
-                            target_url = results[0].get("artworkUrl100", "")
+                            item = results[0]
+                            if not target_url:
+                                target_url = item.get("artworkUrl100", "")
+                            if item.get("collectionExplicitness") == "explicit":
+                                # Album cover itself is marked explicit/parental advisory
+                                pass
         except Exception:
             pass
 
     if not target_url:
-        return [], [24, 24, 24]
+        return [], [24, 24, 24], False
 
-    if target_url in cover_cache:
-        return cover_cache[target_url]["pixels"], cover_cache[target_url]["color"]
+    cache_key = f"{target_url}_{is_explicit_or_nsfw}"
+    if cache_key in cover_cache:
+        c = cover_cache[cache_key]
+        return c["pixels"], c["color"], c["censored"]
+
+    pixels = []
+    dom_color = [24, 24, 24]
 
     # Try Pillow first if installed
     try:
@@ -164,34 +233,38 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                     resample_filter = getattr(Image, "Resampling", Image).LANCZOS
                     dom = img.resize((1, 1), resample_filter).getpixel((0, 0))
                     dom_color = [int(dom[0]), int(dom[1]), int(dom[2])]
-                    small = img.resize((GRID_RES, GRID_RES), resample_filter)
-                    pixels = []
-                    for y in range(GRID_RES):
-                        for x in range(GRID_RES):
+                    small = img.resize((HIGH_RES, HIGH_RES), resample_filter)
+                    for y in range(HIGH_RES):
+                        for x in range(HIGH_RES):
                             r, g, b = small.getpixel((x, y))
                             pixels.append(f"{r:02x}{g:02x}{b:02x}")
-                    cover_cache[target_url] = {"pixels": pixels, "color": dom_color}
-                    return pixels, dom_color
     except Exception:
         pass
 
-    # Built-in fallback (No Pillow required!) via wsrv.nl PNG resizer at 36x36
-    try:
-        proxy_url = f"https://wsrv.nl/?url={target_url}&w={GRID_RES}&h={GRID_RES}&fit=cover&output=png"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(proxy_url, timeout=5) as resp:
-                if resp.status == 200:
-                    png_bytes = await resp.read()
-                    pixels, dom_color = parse_png_to_grid(png_bytes, GRID_RES)
-                    if pixels:
-                        if len(cover_cache) > 120:
-                            cover_cache.clear()
-                        cover_cache[target_url] = {"pixels": pixels, "color": dom_color}
-                        return pixels, dom_color
-    except Exception as e:
-        print("Fallback cover error:", e)
+    # Built-in fallback (No Pillow required!) via wsrv.nl PNG resizer at 45x45
+    if not pixels:
+        try:
+            proxy_url = f"https://wsrv.nl/?url={target_url}&w={HIGH_RES}&h={HIGH_RES}&fit=cover&output=png"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(proxy_url, timeout=5) as resp:
+                    if resp.status == 200:
+                        png_bytes = await resp.read()
+                        pixels, dom_color = parse_png_to_grid(png_bytes, HIGH_RES)
+        except Exception as e:
+            print("Fallback cover error:", e)
 
-    return [], [24, 24, 24]
+    if pixels:
+        # Check image skin-tone ratio for nudity/NSFW detection or slang/NSFW title match
+        if is_explicit_or_nsfw or is_skin_tone_heavy(pixels):
+            pixels = pixelate_hex_grid(pixels, HIGH_RES, CENSOR_RES)
+            is_explicit_or_nsfw = True
+
+        if len(cover_cache) > 100:
+            cover_cache.clear()
+        cover_cache[cache_key] = {"pixels": pixels, "color": dom_color, "censored": is_explicit_or_nsfw}
+        return pixels, dom_color, is_explicit_or_nsfw
+
+    return [], [24, 24, 24], False
 
 @app.route('/api/set_code', methods=['GET'])
 def set_code():
@@ -230,6 +303,7 @@ def get_all_users():
                 "sarki_sozu": "♪ No lyrics",
                 "album_kapak": "",
                 "kapak_pikseller": [],
+                "kapak_sansurlu": False,
                 "bant_renk": [24, 24, 24]
             }
             continue
@@ -272,6 +346,7 @@ def get_all_users():
             "sarki_sozu": aktif_soz[:60],
             "album_kapak": veri.get("album_kapak", ""),
             "kapak_pikseller": veri.get("kapak_pikseller", []),
+            "kapak_sansurlu": veri.get("kapak_sansurlu", False),
             "bant_renk": veri.get("bant_renk", [24, 24, 24])
         }
     return jsonify(sonuc)
@@ -389,6 +464,7 @@ async def extract_member_presence(member: discord.Member):
     synced, plain = None, "♪ No lyrics"
     album_kapak = ""
     kapak_pikseller = []
+    kapak_sansurlu = False
     bant_renk = [24, 24, 24]
 
     for act in member.activities:
@@ -405,7 +481,7 @@ async def extract_member_presence(member: discord.Member):
             if hasattr(act, 'album_cover_url') and act.album_cover_url:
                 album_kapak = str(act.album_cover_url)
 
-            kapak_pikseller, bant_renk = await fetch_album_cover_pixels(album_kapak, act.artist, act.title)
+            kapak_pikseller, bant_renk, kapak_sansurlu = await fetch_album_cover_pixels(album_kapak, act.artist, act.title)
 
             lyrics_text = await get_lyrics(act.artist, act.title, sarki_toplam)
             if lyrics_text != "No lyrics available":
@@ -424,6 +500,7 @@ async def extract_member_presence(member: discord.Member):
         "plain_lyrics": plain,
         "album_kapak": album_kapak,
         "kapak_pikseller": kapak_pikseller,
+        "kapak_sansurlu": kapak_sansurlu,
         "bant_renk": bant_renk
     }
 
