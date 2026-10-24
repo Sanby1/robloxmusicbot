@@ -13,7 +13,7 @@ import zlib
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
-GRID_RES = 20  # 20x20 = 400 pixels for live album cover in Roblox
+GRID_RES = 36  # 36x36 = 1,296 pixels (High-definition, ultra-smooth album cover in Roblox!)
 
 def load_accounts():
     if os.path.exists(DB_FILE):
@@ -42,9 +42,7 @@ SIGN_KANAL_ID = 123456789012345678 # Put your Discord channel ID here
 VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
 
 # =========================================================================
-# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (NO PILLOW REQUIRED!)
-# By fetching a 20x20 PNG from wsrv.nl thumbnail proxy and decoding it with
-# standard library `zlib` + `struct`, this works on ANY Render/Python server!
+# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (36x36 = 1,296 PIXELS)
 # =========================================================================
 def parse_png_to_grid(png_bytes, grid_size=GRID_RES):
     if len(png_bytes) < 33 or png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
@@ -154,7 +152,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     if target_url in cover_cache:
         return cover_cache[target_url]["pixels"], cover_cache[target_url]["color"]
 
-    # Try Pillow first if installed, otherwise use our built-in zero-dependency PNG proxy decoder
+    # Try Pillow first if installed
     try:
         from PIL import Image
         from io import BytesIO
@@ -177,7 +175,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     except Exception:
         pass
 
-    # Built-in fallback (No Pillow required!) via wsrv.nl PNG resizer
+    # Built-in fallback (No Pillow required!) via wsrv.nl PNG resizer at 36x36
     try:
         proxy_url = f"https://wsrv.nl/?url={target_url}&w={GRID_RES}&h={GRID_RES}&fit=cover&output=png"
         async with aiohttp.ClientSession() as session:
@@ -186,7 +184,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                     png_bytes = await resp.read()
                     pixels, dom_color = parse_png_to_grid(png_bytes, GRID_RES)
                     if pixels:
-                        if len(cover_cache) > 150:
+                        if len(cover_cache) > 120:
                             cover_cache.clear()
                         cover_cache[target_url] = {"pixels": pixels, "color": dom_color}
                         return pixels, dom_color
@@ -374,7 +372,6 @@ class MyBot(commands.Bot):
                 )
                 await kanal.send(embed=embed, view=TicketView())
 
-        # Automatically populate presence & album art for all linked users immediately on startup!
         for g in self.guilds:
             for r_name, d_id in list(kayitli_hesaplar.items()):
                 member = g.get_member(d_id)
