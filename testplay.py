@@ -13,6 +13,7 @@ from PIL import Image
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
+GRID_RES = 24  # 24x24 = 576 piksel (Tıpkı örnek oyundaki gibi yüksek netlikli albüm kapağı)
 
 def load_accounts():
     if os.path.exists(DB_FILE):
@@ -37,8 +38,8 @@ roblox_onay_kodlari = {}
 active_tickets = {}
 cover_cache = {} # URL -> {"pixels": [...], "color": [r, g, b]}
 
-SIGN_KANAL_ID = 123456789012345678 # 🔥 KENDİ KANAL ID'Nİ YAZMAYI UNUTMA
-VERIFIED_ROLE_ID = 1540891610739507331 # 🔥 ROL ID'N
+SIGN_KANAL_ID = 123456789012345678 # Put your Discord channel ID here
+VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
 
 @app.route('/api/set_code', methods=['GET'])
 def set_code():
@@ -62,37 +63,53 @@ async def get_lyrics(artist, title, duration):
         pass
     return "No lyrics available"
 
-# 🔥 SPOTIFY ALBÜM KAPAĞINI GERÇEK PİKSEL MATRİSİNE (16x16) VE BASKIN RENGE ÇEVİRİR 🔥
-async def fetch_album_cover_pixels(url):
-    if not url:
+# Converts Spotify Album Cover URL ( or iTunes fallback) into a 24x24 (576 cells) RGB Hex Matrix
+async def fetch_album_cover_pixels(url, artist="", title=""):
+    target_url = url
+    # If Discord didn't provide a cover URL, search iTunes API as a backup
+    if not target_url and artist and title:
+        try:
+            search_q = f"{artist} {title}"
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://itunes.apple.com/search", params={"term": search_q, "entity": "song", "limit": 1}, timeout=3) as r:
+                    if r.status == 200:
+                        js = await r.json(content_type=None)
+                        results = js.get("results", [])
+                        if results:
+                            target_url = results[0].get("artworkUrl100", "")
+        except Exception:
+            pass
+
+    if not target_url:
         return [], [24, 24, 24]
-    if url in cover_cache:
-        return cover_cache[url]["pixels"], cover_cache[url]["color"]
+
+    if target_url in cover_cache:
+        return cover_cache[target_url]["pixels"], cover_cache[target_url]["color"]
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=4) as resp:
+            async with session.get(target_url, timeout=4) as resp:
                 if resp.status == 200:
                     img_bytes = await resp.read()
                     img = Image.open(BytesIO(img_bytes)).convert("RGB")
-                    # 1x1 ile şarkı kapağının gerçek baskın rengini bul
-                    dom = img.resize((1, 1), Image.Resampling.LANCZOS).getpixel((0, 0))
+                    resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+
+                    dom = img.resize((1, 1), resample_filter).getpixel((0, 0))
                     dom_color = [int(dom[0]), int(dom[1]), int(dom[2])]
 
-                    # 16x16=256 piksel matrisi (Roblox'ta canlı albüm kapağını birebir çizer)
-                    small = img.resize((16, 16), Image.Resampling.LANCZOS)
+                    small = img.resize((GRID_RES, GRID_RES), resample_filter)
                     pixels = []
-                    for y in range(16):
-                        for x in range(16):
+                    for y in range(GRID_RES):
+                        for x in range(GRID_RES):
                             r, g, b = small.getpixel((x, y))
                             pixels.append(f"{r:02x}{g:02x}{b:02x}")
 
-                    if len(cover_cache) > 200:
+                    if len(cover_cache) > 150:
                         cover_cache.clear()
-                    cover_cache[url] = {"pixels": pixels, "color": dom_color}
+                    cover_cache[target_url] = {"pixels": pixels, "color": dom_color}
                     return pixels, dom_color
     except Exception as e:
-        print("Kapak işleme hatası:", e)
+        print("Cover image error:", e)
     return [], [24, 24, 24]
 
 @app.route('/api/all_users')
@@ -169,9 +186,9 @@ class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
+    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🔒 Closing ticket in 3 seconds...", ephemeral=False)
+        await interaction.response.send_message("Closing ticket in 3 seconds...", ephemeral=False)
         await asyncio.sleep(3)
         try:
             for uid, cid in list(active_tickets.items()):
@@ -185,7 +202,7 @@ class TicketView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
-    @discord.ui.button(label="📩 Open Verify Ticket", style=discord.ButtonStyle.blurple, custom_id="kayit_ticket_btn")
+    @discord.ui.button(label="Open Verify Ticket", style=discord.ButtonStyle.blurple, custom_id="kayit_ticket_btn")
     async def ticket_ac(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         user_id = interaction.user.id
@@ -208,10 +225,10 @@ class TicketView(discord.ui.View):
         ticket_channel = await guild.create_text_channel(f"verify-{interaction.user.name}", overwrites=overwrites)
         active_tickets[user_id] = ticket_channel.id
 
-        await interaction.response.send_message(f"✅ Your ticket has been opened: {ticket_channel.mention}", ephemeral=True)
+        await interaction.response.send_message(f"Your ticket has been opened: {ticket_channel.mention}", ephemeral=True)
 
         embed = discord.Embed(
-            title="🎵 Roblox & Discord Account Verification",
+            title="Roblox & Discord Account Verification",
             description=(
                 f"Welcome {interaction.user.mention}!\n\n"
                 "To link your Roblox account, look at the **6-digit code** on your Overhead UI in the game and type:\n"
@@ -236,7 +253,7 @@ class MyBot(commands.Bot):
         self.add_view(TicketControlView())
 
     async def on_ready(self):
-        print(f"✅ {self.user} olarak Discord'a giriş yapıldı!")
+        print(f"Logged in as {self.user}!")
         kanal = self.get_channel(SIGN_KANAL_ID)
         if kanal:
             mesaj_var = False
@@ -246,7 +263,7 @@ class MyBot(commands.Bot):
                     break
             if not mesaj_var:
                 embed = discord.Embed(
-                    title="🔗 Link Your Roblox & Discord Accounts",
+                    title="Link Your Roblox & Discord Accounts",
                     description="Click the button below to open a verification ticket and display your live Spotify & gaming status in Roblox!",
                     color=discord.Color.green()
                 )
@@ -275,7 +292,8 @@ async def extract_member_presence(member: discord.Member):
                 sarki_toplam = int(act.duration.total_seconds())
             if hasattr(act, 'album_cover_url') and act.album_cover_url:
                 album_kapak = str(act.album_cover_url)
-                kapak_pikseller, bant_renk = await fetch_album_cover_pixels(album_kapak)
+
+            kapak_pikseller, bant_renk = await fetch_album_cover_pixels(album_kapak, act.artist, act.title)
 
             lyrics_text = await get_lyrics(act.artist, act.title, sarki_toplam)
             if lyrics_text != "No lyrics available":
@@ -301,7 +319,7 @@ async def extract_member_presence(member: discord.Member):
 async def setup_ticket(ctx):
     if ctx.author.guild_permissions.administrator:
         embed = discord.Embed(
-            title="🔗 Link Your Roblox & Discord Accounts",
+            title="Link Your Roblox & Discord Accounts",
             description="Click the button below to open a verification ticket and display your live Spotify & gaming status in Roblox!",
             color=discord.Color.green()
         )
@@ -310,7 +328,7 @@ async def setup_ticket(ctx):
 @bot.command()
 async def verify(ctx, roblox_ismi: str = None, kod: str = None):
     if not roblox_ismi or not kod:
-        await ctx.send("❌ Missing information! Usage example: `!verify YourRobloxName 123456`")
+        await ctx.send("Missing information! Usage example: `!verify YourRobloxName 123456`")
         return
 
     r_isim_lower = roblox_ismi.strip().lower()
@@ -335,7 +353,7 @@ async def verify(ctx, roblox_ismi: str = None, kod: str = None):
         veri_tabani[ctx.author.id] = await extract_member_presence(ctx.author)
 
         embed = discord.Embed(
-            title="✅ Verification Complete!",
+            title="Verification Complete!",
             description=(
                 f"**{roblox_ismi}** has been linked to {ctx.author.mention}.\n"
                 "Your in-game panel will update in a few seconds. This ticket will automatically close in **4 seconds**."
@@ -354,7 +372,7 @@ async def verify(ctx, roblox_ismi: str = None, kod: str = None):
         except Exception:
             pass
     else:
-        await ctx.send("❌ **Error:** The code you entered is wrong or you are not in the game right now!")
+        await ctx.send("**Error:** The code you entered is wrong or you are not in the game right now!")
 
 @bot.event
 async def on_presence_update(before, after):
