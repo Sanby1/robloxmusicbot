@@ -14,7 +14,7 @@ import re
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
-HIGH_RES = 80  # 80x80 = 6,400 pixels (True HD unpixelated cover when safe!)
+HIGH_RES = 40  # 40x40 = 1,600 pixels (Optimal crisp HD resolution with zero Roblox lag!)
 CENSOR_RES = 7 # 7x7 heavy mosaic blocks when NSFW / Explicit / Slang is detected!
 
 SLANG_NSFW_REGEX = re.compile(
@@ -114,7 +114,7 @@ def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     return out
 
 # =========================================================================
-# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (80x80 = 6,400 PIXELS)
+# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (40x40 = 1,600 PIXELS)
 # =========================================================================
 def parse_png_to_grid(png_bytes, grid_size=HIGH_RES):
     if len(png_bytes) < 33 or png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
