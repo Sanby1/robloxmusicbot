@@ -339,8 +339,8 @@ def lookup_list():
 
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-    # 1. Check if the user pasted a Spotify Playlist or Album URL
-    sp_match = re.search(r"open\.spotify\.com/(?:intl-[a-zA-Z-]+/)?(playlist|album)/([a-zA-Z0-9]+)", query)
+    # 1. Check if the user pasted a Spotify Playlist, Album, or Track URL
+    sp_match = re.search(r"open\.spotify\.com/(?:intl-[a-zA-Z-]+/)?(playlist|album|track)/([a-zA-Z0-9]+)", query)
     if sp_match:
         kind, sp_id = sp_match.group(1), sp_match.group(2)
         embed_url = f"https://open.spotify.com/embed/{kind}/{sp_id}"
@@ -348,27 +348,37 @@ def lookup_list():
             req = urllib.request.Request(embed_url, headers=headers)
             with urllib.request.urlopen(req, timeout=6) as resp:
                 html = resp.read().decode("utf-8", errors="ignore")
-                nd_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                nd_match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
                 if nd_match:
                     nd = json.loads(nd_match.group(1))
                     entity = nd.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
                     title = entity.get("name") or entity.get("title") or f"Spotify {kind.title()}"
                     subtitle = entity.get("subtitle") or entity.get("description") or "Spotify"
+                    if not subtitle or subtitle == "Spotify":
+                        authors = entity.get("authors") or entity.get("artists") or []
+                        if isinstance(authors, list) and len(authors) > 0 and isinstance(authors[0], dict):
+                            subtitle = authors[0].get("name") or "Spotify"
                     track_list = entity.get("trackList", [])
+                    if not track_list and kind == "track":
+                        dur_ms = entity.get("duration") or 180000
+                        track_list = [{"title": title, "subtitle": subtitle, "duration": dur_ms}]
                     tracks = []
+                    total_sec = 0
                     for idx, t in enumerate(track_list[:50], 1):
                         dur_ms = t.get("duration") or 0
                         dur_s = int(dur_ms / 1000)
+                        total_sec += dur_s
                         tracks.append({
                             "num": idx,
                             "title": t.get("title") or "Track",
-                            "artist": t.get("subtitle") or "",
+                            "artist": t.get("subtitle") or subtitle,
                             "duration": f"{dur_s // 60}:{dur_s % 60:02d}"
                         })
                     if tracks:
-                        return jsonify({"ok": True, "title": title, "subtitle": subtitle, "tracks": tracks})
+                        return jsonify({"ok": True, "title": title, "subtitle": subtitle, "totalSec": total_sec, "tracks": tracks})
         except Exception as e:
             print("Spotify embed parse fallback:", e)
+        return jsonify({"ok": False, "error": "Could not load Spotify link"}), 404
 
     # 2. Search iTunes Album / Songs API for Album or Artist name
     try:
@@ -409,7 +419,6 @@ async def get_lyrics(artist, title, duration):
     headers = {"User-Agent": "RobloxMusicStatusBot/2.0"}
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
-            # 1. Try exact match first
             for a_try, t_try in [(artist, title), (clean_artist, clean_title)]:
                 if not a_try or not t_try:
                     continue
@@ -422,7 +431,6 @@ async def get_lyrics(artist, title, duration):
                 except Exception:
                     pass
 
-            # 2. Fallback to lrclib search (handles "Motive; UZI - ANAKONDA'S" and duration differences!)
             for q_str in [f"{clean_artist} {clean_title}", f"{artist} {title}", clean_title]:
                 if not q_str.strip():
                     continue
@@ -505,9 +513,87 @@ async def auto_close_ticket(channel, user_id):
     except Exception:
         pass
 
+def build_spotify_fix_embed():
+    embed = discord.Embed(
+        title="Why Is My Spotify Song Not Showing in Game?",
+        description="If you linked your account but your song does not appear in Roblox, check these **3 quick settings** in Discord:",
+        color=discord.Color.from_rgb(30, 215, 96)
+    )
+    embed.add_field(
+        name="1. Enable Spotify Status in Connections",
+        value="Go to **User Settings > Connections > Spotify** and turn ON **Display Spotify as your status**.",
+        inline=False
+    )
+    embed.add_field(
+        name="2. Enable Activity Privacy",
+        value="Go to **User Settings > Activity Privacy** and turn ON **Share your detected activities with others** (and enable it for this server).",
+        inline=False
+    )
+    embed.add_field(
+        name="3. Do Not Use Invisible Mode",
+        value="Discord hides all Spotify activity when your status is **Invisible / Offline**. Set your status to **Online**, **Idle**, or **Do Not Disturb**.",
+        inline=False
+    )
+    return embed
+
+async def run_spotify_status_test(interaction: discord.Interaction):
+    member = interaction.guild.get_member(interaction.user.id) if interaction.guild else None
+    if not member:
+        await interaction.response.send_message("Could not read your member profile right now.", ephemeral=True)
+        return
+
+    linked_roblox = None
+    for r_name, d_id in kayitli_hesaplar.items():
+        if d_id == member.id:
+            linked_roblox = r_name
+            break
+
+    spotify_act = None
+    for act in member.activities:
+        if isinstance(act, discord.Spotify):
+            spotify_act = act
+            break
+
+    status_str = str(member.status)
+    if status_str == "offline" or status_str == "invisible":
+        embed = discord.Embed(
+            title="Spotify Test Result: You Are Invisible / Offline!",
+            description="Your Discord status appears **Offline / Invisible**.\nDiscord does **not** broadcast Spotify activity while Invisible. Switch your Discord status to **Online**, **Idle**, or **Do Not Disturb** and test again!",
+            color=discord.Color.red()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    if spotify_act:
+        veri_tabani[member.id] = await extract_member_presence(member)
+        link_note = f"Linked Roblox Account: **{linked_roblox}**" if linked_roblox else "*(You have not linked a Roblox account yet — click Open Verify Ticket to link!)*"
+        embed = discord.Embed(
+            title="Spotify Test Result: Connected & Working!",
+            description=f"We detected your live Spotify stream:\n**{spotify_act.artist} - {spotify_act.title}**\n\n{link_note}",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        embed = build_spotify_fix_embed()
+        embed.title = "Spotify Test Result: No Active Song Detected"
+        embed.color = discord.Color.orange()
+        await interaction.response.send_message(
+            content="We could not detect Spotify on your Discord profile right now. Make sure a song is playing and check these 3 steps:",
+            embed=embed,
+            ephemeral=True
+        )
+
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="Test My Spotify Status", style=discord.ButtonStyle.success, custom_id="test_spotify_ticket_btn")
+    async def test_spotify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await run_spotify_status_test(interaction)
+
+    @discord.ui.button(label="Spotify Not Showing? (Fix Guide)", style=discord.ButtonStyle.secondary, custom_id="fix_guide_ticket_btn")
+    async def fix_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_spotify_fix_embed(), ephemeral=True)
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -562,6 +648,14 @@ class TicketView(discord.ui.View):
         )
         await ticket_channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
         asyncio.create_task(auto_close_ticket(ticket_channel, user_id))
+
+    @discord.ui.button(label="Test My Spotify Status", style=discord.ButtonStyle.success, custom_id="main_test_spotify_btn")
+    async def main_test_spotify(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await run_spotify_status_test(interaction)
+
+    @discord.ui.button(label="Spotify Not Showing? (Fix Guide)", style=discord.ButtonStyle.secondary, custom_id="main_fix_guide_btn")
+    async def main_fix_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=build_spotify_fix_embed(), ephemeral=True)
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -680,13 +774,20 @@ async def verify(ctx, roblox_ismi: str = None, kod: str = None):
             except Exception:
                 pass
 
-        veri_tabani[ctx.author.id] = await extract_member_presence(ctx.author)
+        pres = await extract_member_presence(ctx.author)
+        veri_tabani[ctx.author.id] = pres
+        has_song = (pres.get("sarki") and pres.get("sarki") != "None")
+        sp_status_line = (
+            f"\n**Live Spotify Detected:** `{pres.get('sarki')}`"
+            if has_song else
+            "\n*(Tip: No Spotify song detected right now. Make sure **Display Spotify as your status** is ON in Discord Connections and you are not Invisible!)*"
+        )
 
         embed = discord.Embed(
             title="Verification Complete!",
             description=(
-                f"**{roblox_ismi}** has been linked to {ctx.author.mention}.\n"
-                "Your in-game panel will update in a few seconds. This ticket will automatically close in **4 seconds**."
+                f"**{roblox_ismi}** has been linked to {ctx.author.mention}.{sp_status_line}\n\n"
+                "Your in-game panel will update in a few seconds. This ticket will automatically close in **5 seconds**."
             ),
             color=discord.Color.green()
         )
