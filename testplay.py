@@ -583,6 +583,94 @@ async def run_spotify_status_test(interaction: discord.Interaction):
             ephemeral=True
         )
 
+active_fix_rooms = {}
+
+async def open_private_spotify_fix_room(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not guild:
+        await interaction.response.send_message(embed=build_spotify_fix_embed(), ephemeral=True)
+        return
+
+    user_id = interaction.user.id
+    if user_id in active_fix_rooms:
+        old_ch = guild.get_channel(active_fix_rooms[user_id])
+        if old_ch:
+            try:
+                await old_ch.delete(reason="User opened a new Spotify fix room")
+            except Exception:
+                pass
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+        guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True, manage_channels=True)
+    }
+
+    fix_channel = await guild.create_text_channel(f"spotify-help-{interaction.user.name}", overwrites=overwrites)
+    active_fix_rooms[user_id] = fix_channel.id
+
+    await interaction.response.send_message(
+        f"Your private Spotify troubleshooting room has been created: {fix_channel.mention}",
+        ephemeral=True
+    )
+
+    member = guild.get_member(user_id)
+    linked_roblox = None
+    for r_name, d_id in kayitli_hesaplar.items():
+        if d_id == user_id:
+            linked_roblox = r_name
+            break
+
+    spotify_act = None
+    if member:
+        for act in member.activities:
+            if isinstance(act, discord.Spotify):
+                spotify_act = act
+                break
+
+    status_str = str(member.status) if member else "unknown"
+    diag_lines = []
+    if linked_roblox:
+        diag_lines.append(f"• **Linked Roblox Account:** `{linked_roblox}` (Verified)")
+    else:
+        diag_lines.append("• **Linked Roblox Account:** `Not Linked Yet!` (Type `!verify YourRobloxName 123456` right here in this room to link!)")
+
+    if status_str in ("offline", "invisible"):
+        diag_lines.append("• **Discord Status:** `Offline / Invisible` — **PROBLEM FOUND:** Discord blocks Spotify activity while you are Invisible! Change your Discord status to **Online**, **Idle**, or **Do Not Disturb**.")
+    else:
+        diag_lines.append(f"• **Discord Status:** `{status_str.title()}` (Good)")
+
+    if spotify_act:
+        diag_lines.append(f"• **Live Spotify Stream:** `{spotify_act.artist} - {spotify_act.title}` (Detected & Working!)")
+    else:
+        diag_lines.append("• **Live Spotify Stream:** `Not Detected` — Follow the **3 Steps** below so Discord shares your song!")
+
+    diag_embed = discord.Embed(
+        title="Personal Spotify & Account Troubleshooter",
+        description=(
+            f"Hello {interaction.user.mention}! This private room was created just for you to solve any connection or Spotify display issues.\n\n"
+            "**Live Account Diagnosis:**\n" + "\n".join(diag_lines)
+        ),
+        color=discord.Color.from_rgb(30, 215, 96)
+    )
+    diag_embed.add_field(
+        name="Step 1 — Enable Spotify Status on Discord",
+        value="Open **Discord User Settings > Connections > Spotify** and turn ON **Display Spotify as your status**.",
+        inline=False
+    )
+    diag_embed.add_field(
+        name="Step 2 — Enable Activity Privacy",
+        value="Open **Discord User Settings > Activity Privacy** and turn ON **Share your detected activities with others** (and make sure Activity Status is enabled for this server).",
+        inline=False
+    )
+    diag_embed.add_field(
+        name="Step 3 — Stay Online & Refresh Song",
+        value="Make sure your Discord status is **Online / Idle / DND** (never Invisible), then pause and play your song on Spotify and click **Test My Spotify Status** below!",
+        inline=False
+    )
+    await fix_channel.send(content=interaction.user.mention, embed=diag_embed, view=TicketControlView())
+    asyncio.create_task(auto_close_ticket(fix_channel, user_id))
+
 class TicketControlView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -591,18 +679,21 @@ class TicketControlView(discord.ui.View):
     async def test_spotify(self, interaction: discord.Interaction, button: discord.ui.Button):
         await run_spotify_status_test(interaction)
 
-    @discord.ui.button(label="Spotify Not Showing? (Fix Guide)", style=discord.ButtonStyle.secondary, custom_id="fix_guide_ticket_btn")
+    @discord.ui.button(label="Spotify Fix Checklist", style=discord.ButtonStyle.secondary, custom_id="fix_guide_ticket_btn")
     async def fix_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(embed=build_spotify_fix_embed(), ephemeral=True)
 
-    @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
+    @discord.ui.button(label="Close Room", style=discord.ButtonStyle.danger, custom_id="close_ticket_btn")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("Closing ticket in 3 seconds...", ephemeral=False)
+        await interaction.response.send_message("Closing room in 3 seconds...", ephemeral=False)
         await asyncio.sleep(3)
         try:
             for uid, cid in list(active_tickets.items()):
                 if cid == interaction.channel.id:
                     del active_tickets[uid]
+            for uid, cid in list(active_fix_rooms.items()):
+                if cid == interaction.channel.id:
+                    del active_fix_rooms[uid]
             await interaction.channel.delete(reason=f"Closed by {interaction.user}")
         except Exception:
             pass
@@ -634,28 +725,28 @@ class TicketView(discord.ui.View):
         ticket_channel = await guild.create_text_channel(f"verify-{interaction.user.name}", overwrites=overwrites)
         active_tickets[user_id] = ticket_channel.id
 
-        await interaction.response.send_message(f"Your ticket has been opened: {ticket_channel.mention}", ephemeral=True)
+        await interaction.response.send_message(f"Your verification room has been opened: {ticket_channel.mention}", ephemeral=True)
 
         embed = discord.Embed(
             title="Roblox & Discord Account Verification",
             description=(
                 f"Welcome {interaction.user.mention}!\n\n"
-                "To link your Roblox account, look at the **6-digit code** on your Overhead UI in the game and type:\n"
+                "To link your Roblox account, look at the **6-digit code** on your Overhead UI (or onboarding card) in the game and type:\n"
                 "```!verify YourRobloxName 123456```\n"
-                "*(This ticket will automatically close once verified or after 24 hours.)*"
+                "*(If your Spotify song is not showing in-game after linking, click **Test My Spotify Status** below!)*"
             ),
             color=discord.Color.blurple()
         )
         await ticket_channel.send(content=interaction.user.mention, embed=embed, view=TicketControlView())
         asyncio.create_task(auto_close_ticket(ticket_channel, user_id))
 
-    @discord.ui.button(label="Test My Spotify Status", style=discord.ButtonStyle.success, custom_id="main_test_spotify_btn")
+    @discord.ui.button(label="Spotify Not Showing? (Open Help Room)", style=discord.ButtonStyle.success, custom_id="main_fix_guide_btn")
+    async def main_fix_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await open_private_spotify_fix_room(interaction)
+
+    @discord.ui.button(label="Quick Spotify Status Test", style=discord.ButtonStyle.secondary, custom_id="main_test_spotify_btn")
     async def main_test_spotify(self, interaction: discord.Interaction, button: discord.ui.Button):
         await run_spotify_status_test(interaction)
-
-    @discord.ui.button(label="Spotify Not Showing? (Fix Guide)", style=discord.ButtonStyle.secondary, custom_id="main_fix_guide_btn")
-    async def main_fix_guide(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(embed=build_spotify_fix_embed(), ephemeral=True)
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -798,7 +889,9 @@ async def verify(ctx, roblox_ismi: str = None, kod: str = None):
         try:
             if ctx.author.id in active_tickets and active_tickets[ctx.author.id] == ctx.channel.id:
                 del active_tickets[ctx.author.id]
-            if ctx.channel.name.startswith("verify-"):
+            if ctx.author.id in active_fix_rooms and active_fix_rooms[ctx.author.id] == ctx.channel.id:
+                del active_fix_rooms[ctx.author.id]
+            if ctx.channel.name.startswith("verify-") or ctx.channel.name.startswith("spotify-help-"):
                 await ctx.channel.delete(reason="Verification Complete")
         except Exception:
             pass
