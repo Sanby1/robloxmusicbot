@@ -14,7 +14,7 @@ import re
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
-HIGH_RES = 55  # 55x55 = 3,025 pixels (Ultra-smooth, unpixelated HD cover when safe!)
+HIGH_RES = 80  # 80x80 = 6,400 pixels (True HD unpixelated cover when safe!)
 CENSOR_RES = 7 # 7x7 heavy mosaic blocks when NSFW / Explicit / Slang is detected!
 
 SLANG_NSFW_REGEX = re.compile(
@@ -50,8 +50,6 @@ VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
 
 # =========================================================================
 # STRICT NSFW SKIN-CLUSTER DETECTOR (AVOIDS FALSE POSITIVES ON NORMAL COVERS)
-# Only triggers if the center of the image is heavily dominated by true human
-# skin tones (prevents normal warm/orange/red album covers from being blurred).
 # =========================================================================
 def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False):
     if not hex_pixels or len(hex_pixels) != grid_size * grid_size:
@@ -60,15 +58,14 @@ def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False)
     skin_total = 0
     center_skin = 0
     center_count = 0
-    c_min = int(grid_size * 0.2)
-    c_max = int(grid_size * 0.8)
+    c_min = int(grid_size * 0.22)
+    c_max = int(grid_size * 0.78)
 
     for idx, hx in enumerate(hex_pixels):
         r = int(hx[0:2], 16)
         g = int(hx[2:4], 16)
         b = int(hx[4:6], 16)
 
-        # Strict RGB + YCbCr human skin-tone check (excludes pure orange/yellow/red graphic art)
         if (r > 105 and g > 50 and b > 35 and
             r > g and g > b and
             (r - g) >= 15 and (r - g) <= 85 and
@@ -90,9 +87,9 @@ def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False)
     total_ratio = skin_total / len(hex_pixels)
     center_ratio = center_skin / max(center_count, 1)
 
-    if is_itunes_explicit and center_ratio >= 0.58:
+    if is_itunes_explicit and center_ratio >= 0.60:
         return True
-    return center_ratio >= 0.72 and total_ratio >= 0.62
+    return center_ratio >= 0.74 and total_ratio >= 0.64
 
 def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     if len(hex_pixels) != grid_size * grid_size:
@@ -117,7 +114,7 @@ def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     return out
 
 # =========================================================================
-# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (55x55 = 3,025 PIXELS)
+# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (80x80 = 6,400 PIXELS)
 # =========================================================================
 def parse_png_to_grid(png_bytes, grid_size=HIGH_RES):
     if len(png_bytes) < 33 or png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
@@ -211,11 +208,9 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     has_slang_or_nsfw = False
     is_itunes_explicit = False
 
-    # 1. Check if song title or artist contains slang / profanity / NSFW keywords
     if SLANG_NSFW_REGEX.search(f"{artist} {title}"):
         has_slang_or_nsfw = True
 
-    # 2. Query iTunes API for fallback cover URL and explicitness metadata
     if artist and title:
         try:
             search_q = f"{artist} {title}"
@@ -247,7 +242,6 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     pixels = []
     dom_color = [24, 24, 24]
 
-    # Try Pillow first if installed (with LANCZOS resampling for maximum sharpness)
     try:
         from PIL import Image, ImageEnhance
         from io import BytesIO
@@ -260,7 +254,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                     dom = img.resize((1, 1), resample_filter).getpixel((0, 0))
                     dom_color = [int(dom[0]), int(dom[1]), int(dom[2])]
                     small = img.resize((HIGH_RES, HIGH_RES), resample_filter)
-                    small = ImageEnhance.Contrast(small).enhance(1.08)
+                    small = ImageEnhance.Contrast(small).enhance(1.06)
                     for y in range(HIGH_RES):
                         for x in range(HIGH_RES):
                             r, g, b = small.getpixel((x, y))
@@ -268,7 +262,6 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     except Exception:
         pass
 
-    # Built-in fallback (No Pillow required!) via wsrv.nl Lanczos PNG resizer at 55x55
     if not pixels:
         try:
             proxy_url = f"https://wsrv.nl/?url={target_url}&w={HIGH_RES}&h={HIGH_RES}&fit=cover&output=png"
@@ -285,7 +278,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
         if should_censor:
             pixels = pixelate_hex_grid(pixels, HIGH_RES, CENSOR_RES)
 
-        if len(cover_cache) > 100:
+        if len(cover_cache) > 80:
             cover_cache.clear()
         cover_cache[cache_key] = {"pixels": pixels, "color": dom_color, "censored": should_censor}
         return pixels, dom_color, should_censor
