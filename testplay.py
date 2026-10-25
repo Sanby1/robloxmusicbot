@@ -292,6 +292,7 @@ def parse_synced_lyrics_to_list(synced_str):
         return []
     out = []
     for line in synced_str.split("\n"):
+        line = line.strip()
         if line.startswith("[") and "]" in line:
             try:
                 time_part = line[1:line.find("]")]
@@ -302,6 +303,19 @@ def parse_synced_lyrics_to_list(synced_str):
                     out.append({"t": line_sec, "text": txt})
             except Exception:
                 pass
+    return out
+
+def build_duration_synced_list_from_plain(plain_str, duration):
+    if not plain_str:
+        return []
+    raw_lines = [ln.strip() for ln in plain_str.split("\n") if ln.strip() and not ln.strip().startswith("[")]
+    if not raw_lines:
+        return []
+    usable_dur = max(15.0, float(duration or 180) - 4.0)
+    step = usable_dur / max(len(raw_lines), 1)
+    out = []
+    for i, ln in enumerate(raw_lines):
+        out.append({"t": round(i * step, 2), "text": ln[:80]})
     return out
 
 @app.route('/api/set_code', methods=['GET'])
@@ -342,7 +356,7 @@ def lookup_list():
                     subtitle = entity.get("subtitle") or entity.get("description") or "Spotify"
                     track_list = entity.get("trackList", [])
                     tracks = []
-                    for idx, t in enumerate(track_list[:30], 1):
+                    for idx, t in enumerate(track_list[:50], 1):
                         dur_ms = t.get("duration") or 0
                         dur_s = int(dur_ms / 1000)
                         tracks.append({
@@ -383,24 +397,51 @@ def lookup_list():
                                     "duration": f"{dur_s // 60}:{dur_s % 60:02d}"
                                 })
                         if tracks:
-                            return jsonify({"ok": True, "title": col_name, "subtitle": art_name, "tracks": tracks[:30]})
+                            return jsonify({"ok": True, "title": col_name, "subtitle": art_name, "tracks": tracks[:50]})
     except Exception as e:
         print("Album lookup error:", e)
 
     return jsonify({"ok": False, "error": "Not found"}), 404
 
 async def get_lyrics(artist, title, duration):
+    clean_artist = re.split(r"[;,/]", str(artist or ""))[0].strip()
+    clean_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", str(title or "")).strip()
+    headers = {"User-Agent": "RobloxMusicStatusBot/2.0"}
     try:
-        url = "https://lrclib.net/api/get"
-        params = {"artist_name": artist, "track_name": title, "duration": duration}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, timeout=4) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data.get("syncedLyrics") or data.get("plainLyrics") or "No lyrics available"
+        async with aiohttp.ClientSession(headers=headers) as session:
+            # 1. Try exact match first
+            for a_try, t_try in [(artist, title), (clean_artist, clean_title)]:
+                if not a_try or not t_try:
+                    continue
+                try:
+                    async with session.get("https://lrclib.net/api/get", params={"artist_name": a_try, "track_name": t_try, "duration": duration}, timeout=4) as resp:
+                        if resp.status == 200:
+                            data = await resp.json(content_type=None)
+                            if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
+                                return data.get("syncedLyrics") or data.get("plainLyrics")
+                except Exception:
+                    pass
+
+            # 2. Fallback to lrclib search (handles "Motive; UZI - ANAKONDA'S" and duration differences!)
+            for q_str in [f"{clean_artist} {clean_title}", f"{artist} {title}", clean_title]:
+                if not q_str.strip():
+                    continue
+                try:
+                    async with session.get("https://lrclib.net/api/search", params={"q": q_str.strip()}, timeout=4) as s_resp:
+                        if s_resp.status == 200:
+                            items = await s_resp.json(content_type=None)
+                            if isinstance(items, list) and len(items) > 0:
+                                for it in items:
+                                    if it.get("syncedLyrics"):
+                                        return it.get("syncedLyrics")
+                                for it in items:
+                                    if it.get("plainLyrics"):
+                                        return it.get("plainLyrics")
+                except Exception:
+                    pass
     except Exception:
         pass
-    return "No lyrics available"
+    return "No lyrics available" 
 
 @app.route('/api/all_users')
 def get_all_users():
@@ -588,8 +629,9 @@ async def extract_member_presence(member: discord.Member):
             if lyrics_text != "No lyrics available":
                 if "\n[" in lyrics_text or lyrics_text.startswith("["):
                     synced_list = parse_synced_lyrics_to_list(lyrics_text)
-                else:
-                    plain = "♪ " + lyrics_text.split("\n")[0][:65]
+                if not synced_list:
+                    synced_list = build_duration_synced_list_from_plain(lyrics_text, sarki_toplam)
+                plain = "♪ " + lyrics_text.split("\n")[0][:65]
 
     return {
         "sarki": sarki,
