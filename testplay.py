@@ -14,11 +14,11 @@ import re
 app = Flask(__name__)
 
 DB_FILE = "verified_accounts.json"
-HIGH_RES = 45  # 45x45 = 2,025 pixels (Ultra-sharp HD album cover when safe!)
-CENSOR_RES = 8 # 8x8 = 64 pixels (Heavy pixelated mosaic blur when NSFW / Explicit / Slang!)
+HIGH_RES = 55  # 55x55 = 3,025 pixels (Ultra-smooth, unpixelated HD cover when safe!)
+CENSOR_RES = 7 # 7x7 heavy mosaic blocks when NSFW / Explicit / Slang is detected!
 
 SLANG_NSFW_REGEX = re.compile(
-    r"\b(sex|sexy|porn|nsfw|nude|naked|hentai|xxx|erotic|fuck|shit|bitch|dick|pussy|ass|slut|whore|cock|boobs|tits|amk|aq|sik|sikiş|yarrak|orospu|piç|göt|meme|çıplak)\b",
+    r"\b(sex|sexy|porn|porno|nsfw|nude|nudes|naked|hentai|xxx|erotic|onlyfans|stripper|fuck|fucking|motherfucker|shit|bitch|dick|pussy|ass|asshole|slut|whore|cock|boobs|tits|cum|bdsm|fetish|amk|aq|sik|sikiş|sikis|sikerim|yarrak|yarak|orospu|piç|pic|göt|got|meme|çıplak|ciplak|kahpe|pezevenk|amcık|amcik|sakso)\b",
     re.IGNORECASE
 )
 
@@ -49,27 +49,50 @@ SIGN_KANAL_ID = 123456789012345678 # Put your Discord channel ID here
 VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
 
 # =========================================================================
-# SKIN-TONE / NSFW HEURISTIC DETECTOR FOR PIXEL GRID
-# If a large percentage of the album cover consists of contiguous skin-tone
-# pixels (potential nudity/NSFW imagery), we automatically censor-pixelate it!
+# STRICT NSFW SKIN-CLUSTER DETECTOR (AVOIDS FALSE POSITIVES ON NORMAL COVERS)
+# Only triggers if the center of the image is heavily dominated by true human
+# skin tones (prevents normal warm/orange/red album covers from being blurred).
 # =========================================================================
-def is_skin_tone_heavy(hex_pixels):
-    if not hex_pixels:
+def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False):
+    if not hex_pixels or len(hex_pixels) != grid_size * grid_size:
         return False
-    skin_count = 0
-    for hx in hex_pixels:
+
+    skin_total = 0
+    center_skin = 0
+    center_count = 0
+    c_min = int(grid_size * 0.2)
+    c_max = int(grid_size * 0.8)
+
+    for idx, hx in enumerate(hex_pixels):
         r = int(hx[0:2], 16)
         g = int(hx[2:4], 16)
         b = int(hx[4:6], 16)
-        # Classic RGB + YCbCr skin-color cluster bounds
-        if (r > 95 and g > 40 and b > 20 and
-            (max(r, g, b) - min(r, g, b)) > 15 and
-            abs(r - g) > 15 and r > g and r > b):
+
+        # Strict RGB + YCbCr human skin-tone check (excludes pure orange/yellow/red graphic art)
+        if (r > 105 and g > 50 and b > 35 and
+            r > g and g > b and
+            (r - g) >= 15 and (r - g) <= 85 and
+            (g - b) <= 55):
             cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
             cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
-            if 77 <= cb <= 127 and 133 <= cr <= 173:
-                skin_count += 1
-    return (skin_count / len(hex_pixels)) >= 0.52
+            if 85 <= cb <= 122 and 136 <= cr <= 168:
+                skin_total += 1
+                y = idx // grid_size
+                x = idx % grid_size
+                if c_min <= x < c_max and c_min <= y < c_max:
+                    center_skin += 1
+
+        y = idx // grid_size
+        x = idx % grid_size
+        if c_min <= x < c_max and c_min <= y < c_max:
+            center_count += 1
+
+    total_ratio = skin_total / len(hex_pixels)
+    center_ratio = center_skin / max(center_count, 1)
+
+    if is_itunes_explicit and center_ratio >= 0.58:
+        return True
+    return center_ratio >= 0.72 and total_ratio >= 0.62
 
 def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     if len(hex_pixels) != grid_size * grid_size:
@@ -94,7 +117,7 @@ def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     return out
 
 # =========================================================================
-# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (45x45 = 2,025 PIXELS)
+# ZERO-DEPENDENCY PURE PYTHON PNG DECODER & RESIZER (55x55 = 3,025 PIXELS)
 # =========================================================================
 def parse_png_to_grid(png_bytes, grid_size=HIGH_RES):
     if len(png_bytes) < 33 or png_bytes[:8] != b'\x89PNG\r\n\x1a\n':
@@ -185,13 +208,14 @@ def parse_png_to_grid(png_bytes, grid_size=HIGH_RES):
 
 async def fetch_album_cover_pixels(url, artist="", title=""):
     target_url = url
-    is_explicit_or_nsfw = False
+    has_slang_or_nsfw = False
+    is_itunes_explicit = False
 
-    # Check if song title or artist contains slang / NSFW keywords
+    # 1. Check if song title or artist contains slang / profanity / NSFW keywords
     if SLANG_NSFW_REGEX.search(f"{artist} {title}"):
-        is_explicit_or_nsfw = True
+        has_slang_or_nsfw = True
 
-    # Query iTunes API both for fallback cover URL and to check official trackExplicitness / collectionExplicitness
+    # 2. Query iTunes API for fallback cover URL and explicitness metadata
     if artist and title:
         try:
             search_q = f"{artist} {title}"
@@ -204,16 +228,18 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                             item = results[0]
                             if not target_url:
                                 target_url = item.get("artworkUrl100", "")
-                            if item.get("collectionExplicitness") == "explicit":
-                                # Album cover itself is marked explicit/parental advisory
-                                pass
+                            if item.get("collectionExplicitness") == "explicit" or item.get("trackExplicitness") == "explicit":
+                                is_itunes_explicit = True
+                            col_name = item.get("collectionName", "")
+                            if SLANG_NSFW_REGEX.search(col_name):
+                                has_slang_or_nsfw = True
         except Exception:
             pass
 
     if not target_url:
         return [], [24, 24, 24], False
 
-    cache_key = f"{target_url}_{is_explicit_or_nsfw}"
+    cache_key = f"{target_url}_{has_slang_or_nsfw}_{is_itunes_explicit}_{HIGH_RES}"
     if cache_key in cover_cache:
         c = cover_cache[cache_key]
         return c["pixels"], c["color"], c["censored"]
@@ -221,9 +247,9 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     pixels = []
     dom_color = [24, 24, 24]
 
-    # Try Pillow first if installed
+    # Try Pillow first if installed (with LANCZOS resampling for maximum sharpness)
     try:
-        from PIL import Image
+        from PIL import Image, ImageEnhance
         from io import BytesIO
         async with aiohttp.ClientSession() as session:
             async with session.get(target_url, timeout=4) as resp:
@@ -234,6 +260,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
                     dom = img.resize((1, 1), resample_filter).getpixel((0, 0))
                     dom_color = [int(dom[0]), int(dom[1]), int(dom[2])]
                     small = img.resize((HIGH_RES, HIGH_RES), resample_filter)
+                    small = ImageEnhance.Contrast(small).enhance(1.08)
                     for y in range(HIGH_RES):
                         for x in range(HIGH_RES):
                             r, g, b = small.getpixel((x, y))
@@ -241,7 +268,7 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
     except Exception:
         pass
 
-    # Built-in fallback (No Pillow required!) via wsrv.nl PNG resizer at 45x45
+    # Built-in fallback (No Pillow required!) via wsrv.nl Lanczos PNG resizer at 55x55
     if not pixels:
         try:
             proxy_url = f"https://wsrv.nl/?url={target_url}&w={HIGH_RES}&h={HIGH_RES}&fit=cover&output=png"
@@ -254,15 +281,14 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
             print("Fallback cover error:", e)
 
     if pixels:
-        # Check image skin-tone ratio for nudity/NSFW detection or slang/NSFW title match
-        if is_explicit_or_nsfw or is_skin_tone_heavy(pixels):
+        should_censor = has_slang_or_nsfw or is_nsfw_skin_heavy(pixels, HIGH_RES, is_itunes_explicit)
+        if should_censor:
             pixels = pixelate_hex_grid(pixels, HIGH_RES, CENSOR_RES)
-            is_explicit_or_nsfw = True
 
         if len(cover_cache) > 100:
             cover_cache.clear()
-        cover_cache[cache_key] = {"pixels": pixels, "color": dom_color, "censored": is_explicit_or_nsfw}
-        return pixels, dom_color, is_explicit_or_nsfw
+        cover_cache[cache_key] = {"pixels": pixels, "color": dom_color, "censored": should_censor}
+        return pixels, dom_color, should_censor
 
     return [], [24, 24, 24], False
 
@@ -295,9 +321,7 @@ def get_all_users():
         veri = veri_tabani.get(discord_id)
         if not veri:
             sonuc[roblox_ismi] = {
-                "oyun": "None",
                 "sarki": "None",
-                "oyun_sure": 0,
                 "sarki_sure": 0,
                 "sarki_toplam": 210,
                 "sarki_sozu": "♪ No lyrics",
@@ -308,10 +332,7 @@ def get_all_users():
             }
             continue
 
-        o_bas = veri.get("oyun_baslangic", 0)
         s_bas = veri.get("sarki_baslangic", 0)
-
-        oyun_sure = int(time.time() - o_bas) if o_bas > 0 else 0
         sarki_sure = int(time.time() - s_bas) if s_bas > 0 else 0
 
         aktif_soz = "♪ No lyrics"
@@ -338,8 +359,6 @@ def get_all_users():
             aktif_soz = veri.get("plain_lyrics", "♪ No lyrics")
 
         sonuc[roblox_ismi] = {
-            "oyun": veri.get("oyun", "None"),
-            "oyun_sure": oyun_sure,
             "sarki": veri.get("sarki", "None"),
             "sarki_sure": sarki_sure,
             "sarki_toplam": veri.get("sarki_toplam", 210),
@@ -442,7 +461,7 @@ class MyBot(commands.Bot):
             if not mesaj_var:
                 embed = discord.Embed(
                     title="Link Your Roblox & Discord Accounts",
-                    description="Click the button below to open a verification ticket and display your live Spotify & gaming status in Roblox!",
+                    description="Click the button below to open a verification ticket and display your live Spotify status in Roblox!",
                     color=discord.Color.green()
                 )
                 await kanal.send(embed=embed, view=TicketView())
@@ -459,8 +478,8 @@ class MyBot(commands.Bot):
 bot = MyBot()
 
 async def extract_member_presence(member: discord.Member):
-    oyun, sarki = "None", "None"
-    oyun_baslangic, sarki_baslangic, sarki_toplam = 0, 0, 210
+    sarki = "None"
+    sarki_baslangic, sarki_toplam = 0, 210
     synced, plain = None, "♪ No lyrics"
     album_kapak = ""
     kapak_pikseller = []
@@ -468,11 +487,7 @@ async def extract_member_presence(member: discord.Member):
     bant_renk = [24, 24, 24]
 
     for act in member.activities:
-        if act.type == discord.ActivityType.playing:
-            oyun = act.name
-            if hasattr(act, 'start') and act.start:
-                oyun_baslangic = act.start.timestamp()
-        elif isinstance(act, discord.Spotify):
+        if isinstance(act, discord.Spotify):
             sarki = f"{act.artist} - {act.title}"
             if hasattr(act, 'start') and act.start:
                 sarki_baslangic = act.start.timestamp()
@@ -491,8 +506,6 @@ async def extract_member_presence(member: discord.Member):
                     plain = lyrics_text
 
     return {
-        "oyun": oyun,
-        "oyun_baslangic": oyun_baslangic,
         "sarki": sarki,
         "sarki_baslangic": sarki_baslangic,
         "sarki_toplam": sarki_toplam,
@@ -509,7 +522,7 @@ async def setup_ticket(ctx):
     if ctx.author.guild_permissions.administrator:
         embed = discord.Embed(
             title="Link Your Roblox & Discord Accounts",
-            description="Click the button below to open a verification ticket and display your live Spotify & gaming status in Roblox!",
+            description="Click the button below to open a verification ticket and display your live Spotify status in Roblox!",
             color=discord.Color.green()
         )
         await ctx.send(embed=embed, view=TicketView())
