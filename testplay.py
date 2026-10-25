@@ -46,6 +46,8 @@ kayitli_hesaplar = load_accounts()
 roblox_onay_kodlari = {}
 active_tickets = {}
 cover_cache = {}
+lyrics_cache = {}
+ticket_cooldowns = {}
 
 SIGN_KANAL_ID = 123456789012345678 # Put your Discord channel ID here
 VERIFIED_ROLE_ID = 1540891610739507331 # Put your Verified role ID here
@@ -322,10 +324,33 @@ def build_duration_synced_list_from_plain(plain_str, duration):
 def set_code():
     user = request.args.get('user')
     code = request.args.get('code')
+    discord_id_str = request.args.get('discord_id')
     if user and code:
-        roblox_onay_kodlari[user.strip().lower()] = code.strip()
+        u_low = user.strip().lower()
+        roblox_onay_kodlari[u_low] = code.strip()
+        if discord_id_str and discord_id_str.strip().isdigit() and u_low not in kayitli_hesaplar:
+            d_id = int(discord_id_str.strip())
+            kayitli_hesaplar[u_low] = d_id
+            save_accounts()
+            try:
+                for g in bot.guilds:
+                    member = g.get_member(d_id)
+                    if member:
+                        asyncio.run_coroutine_threadsafe(
+                            _refresh_restored_member(member),
+                            bot.loop
+                        )
+                        break
+            except Exception:
+                pass
         return "OK", 200
     return "Error", 400
+
+async def _refresh_restored_member(member):
+    try:
+        veri_tabani[member.id] = await extract_member_presence(member)
+    except Exception:
+        pass
 
 # =========================================================================
 # PLAYLIST / ALBUM LOOKUP ENDPOINT FOR "liste" BOARD IN WORKSPACE
@@ -416,6 +441,9 @@ def lookup_list():
 async def get_lyrics(artist, title, duration):
     clean_artist = re.split(r"[;,/]", str(artist or ""))[0].strip()
     clean_title = re.sub(r"\s*[\(\[].*?[\)\]]", "", str(title or "")).strip()
+    cache_k = f"{clean_artist.lower()}_{clean_title.lower()}_{int(duration or 0)}"
+    if cache_k in lyrics_cache:
+        return lyrics_cache[cache_k]
     headers = {"User-Agent": "RobloxMusicStatusBot/2.0"}
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
@@ -427,7 +455,11 @@ async def get_lyrics(artist, title, duration):
                         if resp.status == 200:
                             data = await resp.json(content_type=None)
                             if data and (data.get("syncedLyrics") or data.get("plainLyrics")):
-                                return data.get("syncedLyrics") or data.get("plainLyrics")
+                                res_lyr = data.get("syncedLyrics") or data.get("plainLyrics")
+                                if len(lyrics_cache) > 150:
+                                    lyrics_cache.clear()
+                                lyrics_cache[cache_k] = res_lyr
+                                return res_lyr
                 except Exception:
                     pass
 
@@ -441,9 +473,15 @@ async def get_lyrics(artist, title, duration):
                             if isinstance(items, list) and len(items) > 0:
                                 for it in items:
                                     if it.get("syncedLyrics"):
+                                        if len(lyrics_cache) > 150:
+                                            lyrics_cache.clear()
+                                        lyrics_cache[cache_k] = it.get("syncedLyrics")
                                         return it.get("syncedLyrics")
                                 for it in items:
                                     if it.get("plainLyrics"):
+                                        if len(lyrics_cache) > 150:
+                                            lyrics_cache.clear()
+                                        lyrics_cache[cache_k] = it.get("plainLyrics")
                                         return it.get("plainLyrics")
                 except Exception:
                     pass
@@ -459,6 +497,7 @@ def get_all_users():
         veri = veri_tabani.get(discord_id)
         if not veri:
             sonuc[roblox_ismi] = {
+                "discord_id": str(discord_id),
                 "sarki": "None",
                 "sarki_sure": 0,
                 "sarki_toplam": 210,
@@ -491,6 +530,7 @@ def get_all_users():
             aktif_soz = veri.get("plain_lyrics", "♪ No lyrics")
 
         sonuc[roblox_ismi] = {
+            "discord_id": str(discord_id),
             "sarki": veri.get("sarki", "None"),
             "sarki_sure": sarki_sure,
             "sarki_sure_exact": sarki_sure_float,
@@ -595,10 +635,20 @@ async def open_private_spotify_fix_room(interaction: discord.Interaction):
     if user_id in active_fix_rooms:
         old_ch = guild.get_channel(active_fix_rooms[user_id])
         if old_ch:
-            try:
-                await old_ch.delete(reason="User opened a new Spotify fix room")
-            except Exception:
-                pass
+            await interaction.response.send_message(
+                f"You already have an active troubleshooting room open here: {old_ch.mention}",
+                ephemeral=True
+            )
+            return
+
+    now_ts = time.time()
+    if now_ts - ticket_cooldowns.get(f"fix_{user_id}", 0) < 20:
+        await interaction.response.send_message(
+            "Please wait a few seconds before opening another room.",
+            ephemeral=True
+        )
+        return
+    ticket_cooldowns[f"fix_{user_id}"] = now_ts
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -711,10 +761,20 @@ class TicketView(discord.ui.View):
             old_channel_id = active_tickets[user_id]
             old_channel = guild.get_channel(old_channel_id)
             if old_channel:
-                try:
-                    await old_channel.delete(reason="User opened a new ticket")
-                except Exception:
-                    pass
+                await interaction.response.send_message(
+                    f"You already have an open verification room here: {old_channel.mention}",
+                    ephemeral=True
+                )
+                return
+
+        now_ts = time.time()
+        if now_ts - ticket_cooldowns.get(f"ver_{user_id}", 0) < 20:
+            await interaction.response.send_message(
+                "Please wait a few seconds before opening another ticket.",
+                ephemeral=True
+            )
+            return
+        ticket_cooldowns[f"ver_{user_id}"] = now_ts
 
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(read_messages=False),
