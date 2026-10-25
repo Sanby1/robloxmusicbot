@@ -10,6 +10,8 @@ import json
 import struct
 import zlib
 import re
+import urllib.request
+import urllib.parse
 
 app = Flask(__name__)
 
@@ -285,6 +287,23 @@ async def fetch_album_cover_pixels(url, artist="", title=""):
 
     return [], [24, 24, 24], False
 
+def parse_synced_lyrics_to_list(synced_str):
+    if not synced_str:
+        return []
+    out = []
+    for line in synced_str.split("\n"):
+        if line.startswith("[") and "]" in line:
+            try:
+                time_part = line[1:line.find("]")]
+                m, s = time_part.split(":")
+                line_sec = round(int(m) * 60 + float(s), 2)
+                txt = line[line.find("]") + 1:].strip()
+                if txt:
+                    out.append({"t": line_sec, "text": txt})
+            except Exception:
+                pass
+    return out
+
 @app.route('/api/set_code', methods=['GET'])
 def set_code():
     user = request.args.get('user')
@@ -293,6 +312,82 @@ def set_code():
         roblox_onay_kodlari[user.strip().lower()] = code.strip()
         return "OK", 200
     return "Error", 400
+
+# =========================================================================
+# PLAYLIST / ALBUM LOOKUP ENDPOINT FOR "liste" BOARD IN WORKSPACE
+# Supports Spotify Playlist/Album Links OR Album/Artist Search Queries!
+# =========================================================================
+@app.route('/api/lookup_list', methods=['GET'])
+def lookup_list():
+    query = (request.args.get('q') or "").strip()
+    if not query:
+        return jsonify({"ok": False, "error": "Empty query"}), 400
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # 1. Check if the user pasted a Spotify Playlist or Album URL
+    sp_match = re.search(r"open\.spotify\.com/(?:intl-[a-zA-Z-]+/)?(playlist|album)/([a-zA-Z0-9]+)", query)
+    if sp_match:
+        kind, sp_id = sp_match.group(1), sp_match.group(2)
+        embed_url = f"https://open.spotify.com/embed/{kind}/{sp_id}"
+        try:
+            req = urllib.request.Request(embed_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+                nd_match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+                if nd_match:
+                    nd = json.loads(nd_match.group(1))
+                    entity = nd.get("props", {}).get("pageProps", {}).get("state", {}).get("data", {}).get("entity", {})
+                    title = entity.get("name") or entity.get("title") or f"Spotify {kind.title()}"
+                    subtitle = entity.get("subtitle") or entity.get("description") or "Spotify"
+                    track_list = entity.get("trackList", [])
+                    tracks = []
+                    for idx, t in enumerate(track_list[:30], 1):
+                        dur_ms = t.get("duration") or 0
+                        dur_s = int(dur_ms / 1000)
+                        tracks.append({
+                            "num": idx,
+                            "title": t.get("title") or "Track",
+                            "artist": t.get("subtitle") or "",
+                            "duration": f"{dur_s // 60}:{dur_s % 60:02d}"
+                        })
+                    if tracks:
+                        return jsonify({"ok": True, "title": title, "subtitle": subtitle, "tracks": tracks})
+        except Exception as e:
+            print("Spotify embed parse fallback:", e)
+
+    # 2. Search iTunes Album / Songs API for Album or Artist name
+    try:
+        enc_q = urllib.parse.quote(query)
+        alb_url = f"https://itunes.apple.com/search?term={enc_q}&entity=album&limit=1"
+        req = urllib.request.Request(alb_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            alb_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            results = alb_data.get("results", [])
+            if results:
+                col_id = results[0].get("collectionId")
+                col_name = results[0].get("collectionName") or query
+                art_name = results[0].get("artistName") or ""
+                if col_id:
+                    lookup_url = f"https://itunes.apple.com/lookup?id={col_id}&entity=song"
+                    with urllib.request.urlopen(urllib.request.Request(lookup_url, headers=headers), timeout=5) as l_resp:
+                        l_data = json.loads(l_resp.read().decode("utf-8", errors="ignore"))
+                        tracks = []
+                        for item in l_data.get("results", []):
+                            if item.get("wrapperType") == "track":
+                                dur_s = int((item.get("trackTimeMillis") or 0) / 1000)
+                                tracks.append({
+                                    "num": len(tracks) + 1,
+                                    "title": item.get("trackName") or "Track",
+                                    "artist": item.get("artistName") or art_name,
+                                    "duration": f"{dur_s // 60}:{dur_s % 60:02d}"
+                                })
+                        if tracks:
+                            return jsonify({"ok": True, "title": col_name, "subtitle": art_name, "tracks": tracks[:30]})
+    except Exception as e:
+        print("Album lookup error:", e)
+
+    return jsonify({"ok": False, "error": "Not found"}), 404
 
 async def get_lyrics(artist, title, duration):
     try:
@@ -310,6 +405,7 @@ async def get_lyrics(artist, title, duration):
 @app.route('/api/all_users')
 def get_all_users():
     sonuc = {}
+    now = time.time()
     for roblox_ismi, discord_id in kayitli_hesaplar.items():
         veri = veri_tabani.get(discord_id)
         if not veri:
@@ -318,6 +414,7 @@ def get_all_users():
                 "sarki_sure": 0,
                 "sarki_toplam": 210,
                 "sarki_sozu": "♪ No lyrics",
+                "synced_list": [],
                 "album_kapak": "",
                 "kapak_pikseller": [],
                 "kapak_sansurlu": False,
@@ -326,26 +423,19 @@ def get_all_users():
             continue
 
         s_bas = veri.get("sarki_baslangic", 0)
-        sarki_sure = int(time.time() - s_bas) if s_bas > 0 else 0
+        sarki_sure_float = round(now - s_bas, 2) if s_bas > 0 else 0
+        sarki_sure = int(sarki_sure_float)
 
         aktif_soz = "♪ No lyrics"
-        synced = veri.get("synced_lyrics")
-        if synced:
-            lines = synced.split("\n")
+        synced_list = veri.get("synced_list") or []
+        if synced_list:
             current_line = ""
-            gecikme_suresi = 3
-
-            for line in lines:
-                if line.startswith("[") and "]" in line:
-                    try:
-                        time_part = line[1:line.find("]")]
-                        m, s = time_part.split(":")
-                        line_sec = int(m) * 60 + float(s)
-
-                        if (sarki_sure + gecikme_suresi) >= line_sec:
-                            current_line = line[line.find("]") + 1:].strip()
-                    except Exception:
-                        pass
+            # Exact real-time match (with +0.35s lead to compensate for network/UI tween)
+            for item in synced_list:
+                if (sarki_sure_float + 0.35) >= item["t"]:
+                    current_line = item["text"]
+                else:
+                    break
             if current_line:
                 aktif_soz = "♪ " + current_line
         else:
@@ -354,8 +444,10 @@ def get_all_users():
         sonuc[roblox_ismi] = {
             "sarki": veri.get("sarki", "None"),
             "sarki_sure": sarki_sure,
+            "sarki_sure_exact": sarki_sure_float,
             "sarki_toplam": veri.get("sarki_toplam", 210),
-            "sarki_sozu": aktif_soz[:60],
+            "sarki_sozu": aktif_soz[:80],
+            "synced_list": synced_list,
             "album_kapak": veri.get("album_kapak", ""),
             "kapak_pikseller": veri.get("kapak_pikseller", []),
             "kapak_sansurlu": veri.get("kapak_sansurlu", False),
@@ -473,7 +565,8 @@ bot = MyBot()
 async def extract_member_presence(member: discord.Member):
     sarki = "None"
     sarki_baslangic, sarki_toplam = 0, 210
-    synced, plain = None, "♪ No lyrics"
+    synced_list = []
+    plain = "♪ No lyrics"
     album_kapak = ""
     kapak_pikseller = []
     kapak_sansurlu = False
@@ -494,15 +587,15 @@ async def extract_member_presence(member: discord.Member):
             lyrics_text = await get_lyrics(act.artist, act.title, sarki_toplam)
             if lyrics_text != "No lyrics available":
                 if "\n[" in lyrics_text or lyrics_text.startswith("["):
-                    synced = lyrics_text
+                    synced_list = parse_synced_lyrics_to_list(lyrics_text)
                 else:
-                    plain = lyrics_text
+                    plain = "♪ " + lyrics_text.split("\n")[0][:65]
 
     return {
         "sarki": sarki,
         "sarki_baslangic": sarki_baslangic,
         "sarki_toplam": sarki_toplam,
-        "synced_lyrics": synced,
+        "synced_list": synced_list,
         "plain_lyrics": plain,
         "album_kapak": album_kapak,
         "kapak_pikseller": kapak_pikseller,
