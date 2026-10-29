@@ -62,21 +62,21 @@ def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False)
     skin_total = 0
     center_skin = 0
     center_count = 0
-    c_min = int(grid_size * 0.22)
-    c_max = int(grid_size * 0.78)
+    c_min = int(grid_size * 0.25)
+    c_max = int(grid_size * 0.75)
 
     for idx, hx in enumerate(hex_pixels):
         r = int(hx[0:2], 16)
         g = int(hx[2:4], 16)
         b = int(hx[4:6], 16)
 
-        if (r > 105 and g > 50 and b > 35 and
+        if (r > 115 and g > 55 and b > 40 and
             r > g and g > b and
-            (r - g) >= 15 and (r - g) <= 85 and
-            (g - b) <= 55):
+            (r - g) >= 18 and (r - g) <= 75 and
+            (g - b) <= 45):
             cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b
             cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b
-            if 85 <= cb <= 122 and 136 <= cr <= 168:
+            if 90 <= cb <= 118 and 140 <= cr <= 165:
                 skin_total += 1
                 y = idx // grid_size
                 x = idx % grid_size
@@ -91,9 +91,7 @@ def is_nsfw_skin_heavy(hex_pixels, grid_size=HIGH_RES, is_itunes_explicit=False)
     total_ratio = skin_total / len(hex_pixels)
     center_ratio = center_skin / max(center_count, 1)
 
-    if is_itunes_explicit and center_ratio >= 0.60:
-        return True
-    return center_ratio >= 0.74 and total_ratio >= 0.64
+    return center_ratio >= 0.85 and total_ratio >= 0.78
 
 def pixelate_hex_grid(hex_pixels, grid_size=HIGH_RES, coarse_size=CENSOR_RES):
     if len(hex_pixels) != grid_size * grid_size:
@@ -914,7 +912,10 @@ async def verify(ctx, roblox_ismi: str = None, kod: str = None):
         save_accounts()
 
         try:
-            await ctx.author.edit(nick=roblox_ismi)
+            base_dc_name = ctx.author.global_name or ctx.author.name
+            max_dc_len = max(1, 32 - len(roblox_ismi) - 3)
+            new_nick = f"{base_dc_name[:max_dc_len]} ({roblox_ismi})"
+            await ctx.author.edit(nick=new_nick)
         except Exception:
             pass
 
